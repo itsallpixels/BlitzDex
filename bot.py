@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 import random
 import csv
 import json
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 import asyncio
 from typing import Union
@@ -18,12 +18,25 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 MIN_SPAWN_INTERVAL = 10
 MAX_SPAWN_INTERVAL = 30
 
+# --- Flexible File Paths for Local/Render ---
+# Render sets a DATA_DIR env var for its Disks. If not found, use local path.
+DATA_DIR = os.environ.get('DATA_DIR', os.path.dirname(os.path.realpath(__file__)))
+
+print(f"Using data directory: {DATA_DIR}") # For debugging
+
+# Writable user data (will be on the Render Disk or local)
+CLAIMS_CSV_FILE = os.path.join(DATA_DIR, "card_claims.csv")
+INVENTORY_CSV_FILE = os.path.join(DATA_DIR, "user_inventories.csv")
+CONFIG_FILE = os.path.join(DATA_DIR, "server_configs.json")
+
+# Read-only assets (will be from the Git repo)
+# When running on Render, the code is in /opt/render/project/src/
+# so we use the local script path for these.
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
-CLAIMS_CSV_FILE = os.path.join(SCRIPT_DIR, "card_claims.csv")
 PREFIX_WEIGHTS_CSV_FILE = os.path.join(SCRIPT_DIR, "prefix_weights.csv")
 CARD_NAMES_CSV_FILE = os.path.join(SCRIPT_DIR, "card_names.csv")
-INVENTORY_CSV_FILE = os.path.join(SCRIPT_DIR, "user_inventories.csv")
-CONFIG_FILE = os.path.join(SCRIPT_DIR, "server_configs.json")
+CARDS_PATH = os.path.join(SCRIPT_DIR, "cards")
+THUMBNAILS_PATH = os.path.join(SCRIPT_DIR, "thumbnails")
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="$", intents=intents)
@@ -32,6 +45,7 @@ ALL_CARDS = []
 PREFIX_WEIGHTS = {}
 CARD_ANSWERS = {}
 SERVER_CONFIGS = {}
+
 
 # --- 2. HELPER FUNCTIONS ---
 
