@@ -7,9 +7,10 @@ import random
 import csv
 import json
 from datetime import datetime, timezone, timedelta
-from collections import defaultdict
+from collections import defaultdict, deque
 import asyncio
 from typing import Union
+import traceback
 
 # --- 1. CONFIGURATION & SETUP ---
 load_dotenv()
@@ -18,20 +19,13 @@ TOKEN = os.getenv('DISCORD_TOKEN')
 MIN_SPAWN_INTERVAL = 10
 MAX_SPAWN_INTERVAL = 30
 
-# --- Flexible File Paths for Local/Render ---
-# Render sets a DATA_DIR env var for its Disks. If not found, use local path.
 DATA_DIR = os.environ.get('DATA_DIR', os.path.dirname(os.path.realpath(__file__)))
+print(f"Using data directory: {DATA_DIR}")
 
-print(f"Using data directory: {DATA_DIR}") # For debugging
-
-# Writable user data (will be on the Render Disk or local)
 CLAIMS_CSV_FILE = os.path.join(DATA_DIR, "card_claims.csv")
 INVENTORY_CSV_FILE = os.path.join(DATA_DIR, "user_inventories.csv")
 CONFIG_FILE = os.path.join(DATA_DIR, "server_configs.json")
 
-# Read-only assets (will be from the Git repo)
-# When running on Render, the code is in /opt/render/project/src/
-# so we use the local script path for these.
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 PREFIX_WEIGHTS_CSV_FILE = os.path.join(SCRIPT_DIR, "prefix_weights.csv")
 CARD_NAMES_CSV_FILE = os.path.join(SCRIPT_DIR, "card_names.csv")
@@ -45,7 +39,7 @@ ALL_CARDS = []
 PREFIX_WEIGHTS = {}
 CARD_ANSWERS = {}
 SERVER_CONFIGS = {}
-
+RECENTLY_SPAWNED = deque(maxlen=10)
 
 # --- 2. HELPER FUNCTIONS ---
 
@@ -55,8 +49,7 @@ def load_configs():
         with open(CONFIG_FILE, 'r') as f: SERVER_CONFIGS = json.load(f)
         print(f"Loaded configs for {len(SERVER_CONFIGS)} server(s).")
     except (FileNotFoundError, json.JSONDecodeError):
-        SERVER_CONFIGS = {}
-        print("No config file found. Starting fresh.")
+        SERVER_CONFIGS = {}; print("No config file found. Starting fresh.")
 
 def save_configs():
     with open(CONFIG_FILE, 'w') as f: json.dump(SERVER_CONFIGS, f, indent=4)
@@ -98,8 +91,7 @@ def load_prefix_weights():
     print(f"Loading weights from {PREFIX_WEIGHTS_CSV_FILE}...")
     try:
         with open(PREFIX_WEIGHTS_CSV_FILE, mode='r', encoding='utf-8') as infile:
-            reader = csv.reader(infile)
-            next(reader)
+            reader = csv.reader(infile); next(reader)
             for row in reader:
                 prefix, weight_str = row
                 try: PREFIX_WEIGHTS[prefix.strip()] = int(weight_str)
@@ -111,8 +103,7 @@ def load_card_names():
     print(f"Loading names from {CARD_NAMES_CSV_FILE}...")
     try:
         with open(CARD_NAMES_CSV_FILE, mode='r', encoding='utf-8') as infile:
-            reader = csv.reader(infile)
-            next(reader)
+            reader = csv.reader(infile); next(reader)
             for row in reader:
                 filename, answers = row[0].strip(), [ans.strip() for ans in row[1:] if ans.strip()]
                 if filename and answers: CARD_ANSWERS[filename] = answers
@@ -120,27 +111,29 @@ def load_card_names():
     except FileNotFoundError: print(f"FATAL ERROR: '{CARD_NAMES_CSV_FILE}' not found.")
 
 def load_cards():
-    print("Loading cards from folders...")
-    cards_path = os.path.join(SCRIPT_DIR, "cards")
-    thumbnails_path = os.path.join(SCRIPT_DIR, "thumbnails")
-    if not os.path.isdir(cards_path):
-        print(f"FATAL ERROR: '{cards_path}' directory not found.")
-        return
-    for filename in os.listdir(cards_path):
+    print("Loading and verifying cards from folders...")
+    if not os.path.isdir(CARDS_PATH):
+        print(f"FATAL ERROR: 'cards' directory not found at {CARDS_PATH}."); return
+    if not os.path.isdir(THUMBNAILS_PATH):
+        print(f"FATAL ERROR: 'thumbnails' directory not found at {THUMBNAILS_PATH}."); return
+    for filename in os.listdir(CARDS_PATH):
         if not filename.endswith(".png") or '_' not in filename: continue
         if filename not in CARD_ANSWERS:
-            print(f"Warning: '{filename}' not in {CARD_NAMES_CSV_FILE}. Skipping.")
-            continue
+            print(f"WARNING: Skipping '{filename}' because it's not defined in {CARD_NAMES_CSV_FILE}."); continue
+        full_path = os.path.join(CARDS_PATH, filename)
+        thumb_path = os.path.join(THUMBNAILS_PATH, f"{filename.replace('.png', '')}_thumb.png")
+        if not os.path.exists(full_path):
+            print(f"WARNING: Skipping '{filename}' because main image is missing."); continue
+        if not os.path.exists(thumb_path):
+            print(f"WARNING: Skipping '{filename}' because thumbnail is missing."); continue
         prefix, answers = filename.split('_', 1)[0], CARD_ANSWERS[filename]
         weight = PREFIX_WEIGHTS.get(prefix, 1)
-        card_info = {"main_name": answers[0], "all_answers": answers, "weight": weight,
-                     "full_path": os.path.join(cards_path, filename),
-                     "thumb_path": os.path.join(thumbnails_path, f"{filename.replace('.png', '')}_thumb.png")}
+        card_info = {"main_name": answers[0], "all_answers": answers, "weight": weight, "full_path": full_path, "thumb_path": thumb_path}
         ALL_CARDS.append(card_info)
-    print(f"Loaded {len(ALL_CARDS)} card files.")
+    print(f"Successfully loaded and verified {len(ALL_CARDS)} card files.")
 
 def log_card_claim(user: discord.User, card_name: str):
-    header, row = ["timestamp", "user_id", "username", "card_name"], [datetime.now().isoformat(), user.id, user.name, card_name]
+    header, row = ["timestamp", "user_id", "username", "card_name"], [datetime.now(timezone.utc).isoformat(), user.id, user.name, card_name]
     file_exists = os.path.exists(CLAIMS_CSV_FILE)
     with open(CLAIMS_CSV_FILE, 'a', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
@@ -158,8 +151,7 @@ class GuessingModal(ui.Modal, title="Guess the Card!"):
         user_guess = self.guess.value.strip().lower()
         if user_guess in self.spawn_view.correct_answers_list:
             if self.spawn_view.claimed:
-                await interaction.response.send_message("Someone just beat you to it!", ephemeral=True)
-                return
+                await interaction.response.send_message("Someone just beat you to it!", ephemeral=True); return
             self.spawn_view.claimed = True
             self.spawn_view.stop()
             for child in self.spawn_view.children: child.disabled = True
@@ -196,57 +188,111 @@ class SpawnView(ui.View):
 
 # --- 5. SPAWN LOGIC AND SLASH COMMANDS ---
 
-async def do_spawn(channel):
-    if not ALL_CARDS: return
-    chosen_card = random.choices(ALL_CARDS, weights=[c['weight'] for c in ALL_CARDS], k=1)[0]
+async def do_spawn(source, specific_card_name: str = None):
+    if not ALL_CARDS:
+        if isinstance(source, discord.Interaction):
+            await source.followup.send("Card data isn't loaded.", ephemeral=True)
+        return
+
+    chosen_card = None
+    if specific_card_name:
+        chosen_card = next((card for card in ALL_CARDS if card['main_name'].lower() == specific_card_name.lower()), None)
+    else:
+        eligible_cards = [card for card in ALL_CARDS if card['main_name'] not in RECENTLY_SPAWNED]
+        if not eligible_cards:
+            print("All cards recently spawned. Spawning from full pool as fallback.")
+            eligible_cards = ALL_CARDS
+        eligible_weights = [card['weight'] for card in eligible_cards]
+        chosen_card = random.choices(eligible_cards, weights=eligible_weights, k=1)[0]
+    
+    if not chosen_card:
+        if isinstance(source, discord.Interaction):
+            await source.followup.send(f"Could not find a card named '{specific_card_name}'.", ephemeral=True)
+        print(f"Attempted to spawn non-existent card: {specific_card_name}")
+        return
+
+    RECENTLY_SPAWNED.append(chosen_card['main_name'])
     embed = discord.Embed(title="A Wild Card Has Appeared!", description="Click the button and guess its name!", color=discord.Color.blue())
     view = SpawnView(main_display_name=chosen_card['main_name'], correct_answers_list=chosen_card['all_answers'], full_card_path=chosen_card['full_path'])
+    
     try:
         with open(chosen_card['thumb_path'], 'rb') as f:
-            message = await channel.send(embed=embed, file=discord.File(f), view=view)
+            picture = discord.File(f)
+            if isinstance(source, discord.Interaction):
+                message = await source.followup.send(embed=embed, file=picture, view=view, wait=True)
+            else:
+                message = await source.send(embed=embed, file=picture, view=view)
             view.message = message
-    except FileNotFoundError: print(f"Error: Thumbnail not found: {chosen_card['thumb_path']}")
+    except FileNotFoundError:
+        print(f"CRITICAL RUNTIME ERROR: Thumbnail not found for a verified card: {chosen_card['thumb_path']}")
 
-@tasks.loop(minutes=1)
-async def timed_spawn():
-    next_spawn_in = random.randint(MIN_SPAWN_INTERVAL, MAX_SPAWN_INTERVAL)
-    timed_spawn.change_interval(minutes=next_spawn_in)
-    print(f"Next spawn scheduled in {next_spawn_in} minutes.")
-    for guild_id_str, config in SERVER_CONFIGS.items():
-        channel_id = config.get("spawn_channel_id")
-        if channel_id:
-            channel = bot.get_channel(channel_id)
-            if channel:
-                print(f"Spawning card in server {channel.guild.name}...")
-                await do_spawn(channel)
-            else: print(f"Could not find channel {channel_id} for server {guild_id_str}.")
+# --- MODIFIED: The timed task is now more robust ---
+@tasks.loop(seconds=30)
+async def timed_spawn_checker():
+    now = datetime.now(timezone.utc)
+    for guild_id_str, config in list(SERVER_CONFIGS.items()):
+        try: # <-- Error handling is now INSIDE the loop for each server
+            channel_id = config.get("spawn_channel_id")
+            next_spawn_time_str = config.get("next_spawn_time")
+            
+            if not (channel_id and next_spawn_time_str):
+                continue
 
-@timed_spawn.before_loop
-async def before_timed_spawn():
-    await bot.wait_until_ready()
-    first_spawn_in = random.randint(MIN_SPAWN_INTERVAL, MAX_SPAWN_INTERVAL)
-    print(f"First spawn scheduled in {first_spawn_in} minutes.")
-    await asyncio.sleep(first_spawn_in * 60)
+            next_spawn_time = datetime.fromisoformat(next_spawn_time_str)
+
+            if now >= next_spawn_time:
+                channel = bot.get_channel(channel_id)
+                if channel:
+                    print(f"Spawning card for server {guild_id_str}...")
+                    await do_spawn(channel)
+                    
+                    next_interval = random.randint(MIN_SPAWN_INTERVAL, MAX_SPAWN_INTERVAL)
+                    new_next_spawn_time = datetime.now(timezone.utc) + timedelta(minutes=next_interval)
+                    SERVER_CONFIGS[guild_id_str]["next_spawn_time"] = new_next_spawn_time.isoformat()
+                    print(f"Next spawn for {guild_id_str} in {next_interval} minutes.")
+                else:
+                    print(f"Could not find configured channel {channel_id} for server {guild_id_str}.")
+        
+        except Exception: # Catch any and all errors for this specific server
+            print(f"--- UNHANDLED EXCEPTION FOR SERVER {guild_id_str} ---")
+            traceback.print_exc()
+            print("--- Continuing to next server ---")
+
+    save_configs() # Save configs once at the end of all checks
 
 # --- COMMANDS ---
+
 @bot.tree.command(name="ping", description="Replies with the bot's latency.")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message(f"Pong! `({round(bot.latency * 1000)}ms)`")
 
+def has_spawn_permission(interaction: discord.Interaction) -> bool:
+    user = interaction.user; guild_id = str(interaction.guild.id)
+    config = SERVER_CONFIGS.get(guild_id, {}); allowed_ids = config.get("spawn_allowed_ids", [])
+    if user.guild_permissions.manage_guild: return True
+    if user.id in allowed_ids: return True
+    if any(role.id in allowed_ids for role in user.roles): return True
+    return False
+
 @bot.tree.command(name="spawn", description="Manually spawns a random card.")
 async def manual_spawn(interaction: discord.Interaction):
-    user = interaction.user
-    guild_id = str(interaction.guild.id)
-    config = SERVER_CONFIGS.get(guild_id, {})
-    allowed_ids = config.get("spawn_allowed_ids", [])
-    is_admin = user.guild_permissions.manage_guild
-    user_allowed = user.id in allowed_ids
-    role_allowed = any(role.id in allowed_ids for role in user.roles)
-    if not (is_admin or user_allowed or role_allowed):
-        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
-        return
-    await interaction.response.send_message("Spawning a card...", ephemeral=True)
-    await do_spawn(interaction.channel)
+    if not has_spawn_permission(interaction):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True); return
+    await interaction.response.defer()
+    await do_spawn(interaction)
+
+@bot.tree.command(name="spawn_card", description="Manually spawns a specific card.")
+@app_commands.describe(card_name="The name of the card to spawn.")
+async def specific_spawn(interaction: discord.Interaction, card_name: str):
+    if not has_spawn_permission(interaction):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True); return
+    await interaction.response.defer()
+    await do_spawn(interaction, specific_card_name=card_name)
+
+@specific_spawn.autocomplete('card_name')
+async def specific_spawn_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    all_card_names = [card['main_name'] for card in ALL_CARDS]
+    return [app_commands.Choice(name=name, value=name) for name in all_card_names if current.lower() in name.lower()][:25]
 
 @bot.tree.command(name="inventory", description="Check your or another user's card inventory.")
 @app_commands.describe(user="The user whose inventory you want to see (optional).")
@@ -258,12 +304,8 @@ async def inventory(interaction: discord.Interaction, user: discord.Member = Non
     else:
         card_list = "".join([f"**{name}** `x{count}`\n" for name, count in sorted(inv.items())])
         desc += f"**Unique Cards: {len(inv)}**\n\n{card_list}"
-    
-    # --- THIS IS THE FIX ---
     embed.description = desc
     embed.set_thumbnail(url=target_user.display_avatar.url)
-    # -----------------------
-    
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="give", description="Give one of your cards to another user.")
@@ -289,24 +331,31 @@ async def card_view(interaction: discord.Interaction, card_name: str):
     card_to_show = next((card for card in ALL_CARDS if card['main_name'] == card_name), None)
     if not card_to_show:
         await interaction.response.send_message("Error finding that card's image.", ephemeral=True); return
-    embed = discord.Embed(title=card_name, color=discord.Color.dark_gold())
+    embed = discord.Embed(title=f"{interaction.user.display_name} is viewing:", description=f"**{card_name}**", color=discord.Color.dark_gold())
     with open(card_to_show['full_path'], 'rb') as f:
-        await interaction.response.send_message(embed=embed, file=discord.File(f), ephemeral=True)
+        picture = discord.File(f)
+        await interaction.response.send_message(embed=embed, file=picture)
 
 @card_view.autocomplete('card_name')
 async def card_view_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     return [app_commands.Choice(name=card, value=card) for card in get_user_inventory(interaction.user.id) if current.lower() in card.lower()][:25]
 bot.tree.add_command(card_group)
 
-config_group = app_commands.Group(name="config", description="Admin commands to configure the bot for this server.", default_permissions=discord.Permissions(manage_guild=True))
+config_group = app_commands.Group(name="config", description="Admin commands for this server.", default_permissions=discord.Permissions(manage_guild=True))
 @config_group.command(name="spawn_channel", description="Set the channel where cards will automatically spawn.")
 @app_commands.describe(channel="The text channel to set for spawns.")
 async def set_spawn_channel(interaction: discord.Interaction, channel: discord.TextChannel):
     guild_id = str(interaction.guild.id)
     if guild_id not in SERVER_CONFIGS: SERVER_CONFIGS[guild_id] = {}
     SERVER_CONFIGS[guild_id]["spawn_channel_id"] = channel.id
+    if "next_spawn_time" not in SERVER_CONFIGS[guild_id]:
+        first_interval = random.randint(MIN_SPAWN_INTERVAL, MAX_SPAWN_INTERVAL)
+        first_spawn_time = datetime.now(timezone.utc) + timedelta(minutes=first_interval)
+        SERVER_CONFIGS[guild_id]["next_spawn_time"] = first_spawn_time.isoformat()
+        await interaction.response.send_message(f"✅ Spawn channel set. First card will spawn in ~{first_interval} minutes.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"✅ Spawn channel updated to {channel.mention}.", ephemeral=True)
     save_configs()
-    await interaction.response.send_message(f"✅ Spawn channel set to {channel.mention}.", ephemeral=True)
 
 @config_group.command(name="allow_spawn", description="Allow a user or role to use the /spawn command.")
 @app_commands.describe(target="The user or role to grant permission to.")
@@ -314,13 +363,11 @@ async def allow_spawn(interaction: discord.Interaction, target: Union[discord.Me
     guild_id = str(interaction.guild.id)
     if guild_id not in SERVER_CONFIGS: SERVER_CONFIGS[guild_id] = {}
     if "spawn_allowed_ids" not in SERVER_CONFIGS[guild_id]: SERVER_CONFIGS[guild_id]["spawn_allowed_ids"] = []
-    
     if target.id not in SERVER_CONFIGS[guild_id]["spawn_allowed_ids"]:
         SERVER_CONFIGS[guild_id]["spawn_allowed_ids"].append(target.id)
         save_configs()
-        await interaction.response.send_message(f"✅ {target.mention} can now use the `/spawn` command.", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"⚠️ {target.mention} already has permission.", ephemeral=True)
+        await interaction.response.send_message(f"✅ {target.mention} can now use `/spawn`.", ephemeral=True)
+    else: await interaction.response.send_message(f"⚠️ {target.mention} already has permission.", ephemeral=True)
 
 @config_group.command(name="deny_spawn", description="Revoke a user or role's permission to use /spawn.")
 @app_commands.describe(target="The user or role to revoke permission from.")
@@ -328,23 +375,18 @@ async def deny_spawn(interaction: discord.Interaction, target: Union[discord.Mem
     guild_id = str(interaction.guild.id)
     if guild_id not in SERVER_CONFIGS or "spawn_allowed_ids" not in SERVER_CONFIGS[guild_id]:
         await interaction.response.send_message("⚠️ No custom spawn permissions are set.", ephemeral=True); return
-    
     if target.id in SERVER_CONFIGS[guild_id]["spawn_allowed_ids"]:
         SERVER_CONFIGS[guild_id]["spawn_allowed_ids"].remove(target.id)
         save_configs()
-        await interaction.response.send_message(f"✅ {target.mention} can no longer use the `/spawn` command.", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"⚠️ {target.mention} did not have custom permission.", ephemeral=True)
+        await interaction.response.send_message(f"✅ {target.mention} can no longer use `/spawn`.", ephemeral=True)
+    else: await interaction.response.send_message(f"⚠️ {target.mention} did not have custom permission.", ephemeral=True)
 
 @config_group.command(name="view_spawn_permissions", description="View who has custom permission to use /spawn.")
 async def view_spawn_permissions(interaction: discord.Interaction):
     guild_id = str(interaction.guild.id)
-    config = SERVER_CONFIGS.get(guild_id, {})
-    allowed_ids = config.get("spawn_allowed_ids", [])
+    allowed_ids = SERVER_CONFIGS.get(guild_id, {}).get("spawn_allowed_ids", [])
     desc = "**Users with `Manage Server` permission can always use `/spawn`.**\n\n**Custom Permissions:**\n"
-    if not allowed_ids: desc += "None set."
-    else:
-        for entity_id in allowed_ids: desc += f"- <@&{entity_id}> / <@{entity_id}>\n"
+    desc += "\n".join([f"- <@&{entity_id}> / <@{entity_id}>" for entity_id in allowed_ids]) if allowed_ids else "None set."
     embed = discord.Embed(title="`/spawn` Command Permissions", description=desc, color=discord.Color.orange())
     await interaction.response.send_message(embed=embed, ephemeral=True)
 bot.tree.add_command(config_group)
@@ -354,12 +396,15 @@ bot.tree.add_command(config_group)
 @bot.event
 async def on_ready():
     print(f'Logged in as {bot.user} (ID: {bot.user.id})'); print('------')
-    load_configs(); load_prefix_weights(); load_card_names(); load_cards()
+    load_configs()
+    load_prefix_weights()
+    load_card_names()
+    load_cards()
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} command(s)")
     except Exception as e: print(e)
-    timed_spawn.start()
+    timed_spawn_checker.start()
 
 # --- 7. RUN THE BOT ---
 bot.run(TOKEN)
